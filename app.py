@@ -1,7 +1,9 @@
 import os
 import hmac
-from datetime import date, datetime
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -33,6 +35,7 @@ ATTENDANCE_COLUMNS = [
     "Hora Salida",
     "Tarifa por Hora",
 ]
+_PERU_TIMEZONE = ZoneInfo("America/Lima")
 
 
 class AirtableAPIError(RuntimeError):
@@ -204,8 +207,19 @@ def _coerce_datetime(value):
     parsed = pd.to_datetime(value, errors="coerce", utc=True)
     if pd.isna(parsed):
         return pd.NaT
-    local_timezone = datetime.now().astimezone().tzinfo
-    return parsed.tz_convert(local_timezone).tz_localize(None)
+    return parsed.tz_convert(_PERU_TIMEZONE).tz_localize(None)
+
+
+def _peru_now():
+    return datetime.now(_PERU_TIMEZONE)
+
+
+def _today_in_peru():
+    return _peru_now().date()
+
+
+def _round_to_cents(value):
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _coerce_date(value):
@@ -312,6 +326,96 @@ def load_data_from_airtable():
     return df
 
 
+def _build_payroll_report(df, start_date=None, end_date=None):
+    """Build per-shift detail and per-employee totals from attendance records."""
+    detail_columns = [
+        "ID Empleado",
+        "Nombre Completo",
+        "Fecha Registro",
+        "Hora Entrada",
+        "Hora Salida",
+        "Horas Trabajadas",
+        "Pago por turno (S/)",
+    ]
+    summary_columns = [
+        "ID Empleado",
+        "Nombre Completo",
+        "Horas Totales",
+        "Pago total (S/)",
+    ]
+    if df.empty:
+        return (
+            pd.DataFrame(columns=detail_columns),
+            pd.DataFrame(columns=summary_columns),
+        )
+    if (start_date is None) != (end_date is None):
+        raise ValueError("Debe proporcionar ambas fechas del rango del reporte.")
+    if start_date is not None and start_date > end_date:
+        raise ValueError("La fecha inicial no puede ser posterior a la fecha final.")
+
+    completed = df[
+        df["Hora Entrada"].notna() & df["Hora Salida"].notna()
+    ].copy()
+    if start_date is not None:
+        completed["Fecha Registro"] = completed["Fecha Registro"].apply(_coerce_date)
+        completed = completed[
+            completed["Fecha Registro"].apply(
+                lambda value: pd.notna(value) and start_date <= value <= end_date
+            )
+        ]
+
+    if completed.empty:
+        return (
+            pd.DataFrame(columns=detail_columns),
+            pd.DataFrame(columns=summary_columns),
+        )
+
+    def calculate_pay(row):
+        entrada = pd.to_datetime(row["Hora Entrada"])
+        salida = pd.to_datetime(row["Hora Salida"])
+        if pd.isna(entrada) or pd.isna(salida):
+            return pd.Series({"Horas Trabajadas": 0.0, "Pago por turno (S/)": 0.0})
+
+        duration = salida - entrada
+        seconds = (
+            Decimal(duration.days * 86400 + duration.seconds)
+            + Decimal(duration.microseconds) / Decimal("1000000")
+        )
+        hours = (seconds / Decimal("3600")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        rate = pd.to_numeric(row.get("Tarifa por Hora", 0.0), errors="coerce")
+        rate = Decimal("0") if pd.isna(rate) else Decimal(str(rate))
+        pay = (hours * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return pd.Series(
+            {
+                "Horas Trabajadas": float(hours),
+                "Pago por turno (S/)": float(pay),
+            }
+        )
+
+    completed[["Horas Trabajadas", "Pago por turno (S/)"]] = completed.apply(
+        calculate_pay, axis=1
+    )
+    detail = completed[detail_columns].copy()
+    summary = (
+        detail.groupby(["ID Empleado", "Nombre Completo"], dropna=False, as_index=False)
+        .agg(
+            **{
+                "Horas Totales": ("Horas Trabajadas", "sum"),
+                "Pago total (S/)": ("Pago por turno (S/)", "sum"),
+            }
+        )[summary_columns]
+    )
+    summary["Horas Totales"] = summary["Horas Totales"].apply(
+        lambda value: float(_round_to_cents(value))
+    )
+    summary["Pago total (S/)"] = summary["Pago total (S/)"].apply(
+        lambda value: float(_round_to_cents(value))
+    )
+    return detail, summary
+
+
 def _find_employee(employee_id):
     escaped_id = str(employee_id).replace("\\", "\\\\").replace('"', '\\"')
     result = _airtable_request(
@@ -350,7 +454,7 @@ def _find_open_record(employee_id):
     df = load_data_from_airtable()
     matches = df[
         (df["ID Empleado"].astype(str) == str(employee_id))
-        & (df["Fecha Registro"] == date.today())
+        & (df["Fecha Registro"] == _today_in_peru())
         & df["Hora Entrada"].notna()
         & df["Hora Salida"].isna()
     ]
@@ -375,10 +479,10 @@ def clock_in(employee_id, employee_name="", rate_per_hour=0.0):
             st.info(f"Ya existe una entrada abierta para {employee_id} hoy.")
         return existing
 
-    now = datetime.now().astimezone()
+    now = _peru_now()
     fields = {
         "Trabajador": str(employee_id),
-        "Fecha": date.today().isoformat(),
+        "Fecha": now.date().isoformat(),
         "Hora de entrada": now.isoformat(timespec="seconds"),
         "Pago por hora": employee["rate_per_hour"],
     }
@@ -406,7 +510,7 @@ def clock_out(employee_id, employee_name="", rate_per_hour=0.0):
         return None
 
     fields = {
-        "Hora de salida": datetime.now().astimezone().isoformat(timespec="seconds")
+        "Hora de salida": _peru_now().isoformat(timespec="seconds")
     }
     updated = _airtable_request(
         "PATCH",
@@ -423,13 +527,13 @@ def clock_out(employee_id, employee_name="", rate_per_hour=0.0):
     return normalized
 
 
-def generate_report():
-    """Return a payroll report after validating completed attendance records."""
+def generate_report(start_date=None, end_date=None):
+    """Render and return a payroll detail report for the selected date range."""
     if st is not None:
         if not _is_admin_authenticated():
             st.error("Solo los administradores pueden generar o consultar reportes.")
             return pd.DataFrame()
-        st.subheader("📊 Reporte Diario / Mensual")
+        st.subheader("📊 Reporte de nómina")
 
     df = load_data_from_airtable()
     if df.empty:
@@ -437,45 +541,25 @@ def generate_report():
             st.warning("No hay registros de asistencia para mostrar.")
         return df.drop(columns=["_airtable_record_id"])
 
-    df_calculable = df[
-        pd.notnull(df["Hora Entrada"]) & pd.notnull(df["Hora Salida"])
-    ].copy()
-
-    if df_calculable.empty:
+    detail, summary = _build_payroll_report(df, start_date, end_date)
+    if detail.empty:
         if st is not None:
-            st.info("Aún no hay registros de salida completados para calcular el pago.")
-        return df_calculable.drop(columns=["_airtable_record_id"])
-
-    def calculate_pay(row):
-        entrada = pd.to_datetime(row["Hora Entrada"])
-        salida = pd.to_datetime(row["Hora Salida"])
-        tarifa = float(row.get("Tarifa por Hora", 0.0) or 0.0)
-
-        if pd.isna(entrada) or pd.isna(salida):
-            return pd.Series({"Horas Trabajadas": 0.0, "Pago Bruto": 0.0})
-
-        horas_decimales = (salida - entrada).total_seconds() / 3600.0
-        pago_bruto = round(horas_decimales * tarifa, 2)
-        return pd.Series({"Horas Trabajadas": horas_decimales, "Pago Bruto": pago_bruto})
-
-    df_calculable[["Horas Trabajadas", "Pago Bruto"]] = df_calculable.apply(
-        calculate_pay, axis=1
-    )
-    columna_reporte = df_calculable[
-        [
-            "ID Empleado",
-            "Nombre Completo",
-            "Fecha Registro",
-            "Hora Entrada",
-            "Hora Salida",
-            "Horas Trabajadas",
-            "Pago Bruto",
-        ]
-    ]
+            st.info(
+                "No hay turnos completos en el rango seleccionado. "
+                "Los turnos sin entrada o salida se excluyen del cálculo."
+            )
+        return detail
 
     if st is not None:
-        st.dataframe(columna_reporte, width="stretch")
-    return columna_reporte
+        st.caption(
+            "Solo se incluyen turnos con hora de entrada y salida; "
+            "los turnos incompletos se excluyen de horas y pagos."
+        )
+        st.subheader("Resumen por trabajador")
+        st.dataframe(summary, width="stretch")
+        st.subheader("Detalle por turno")
+        st.dataframe(detail, width="stretch")
+    return detail
 
 
 def _show_airtable_error(action):
@@ -514,5 +598,29 @@ if __name__ == "__main__" and st is not None:
 
     st.markdown("---")
     if _is_admin_authenticated():
+        today = _today_in_peru()
+        default_start = today - timedelta(days=29)
+        date_columns = st.columns(2)
+        with date_columns[0]:
+            start_date = st.date_input(
+                "Desde",
+                value=default_start,
+                key="report_start_date",
+            )
+        with date_columns[1]:
+            end_date = st.date_input(
+                "Hasta",
+                value=today,
+                key="report_end_date",
+            )
+        st.caption(
+            "El reporte incluye turnos completos del rango indicado. "
+            "Los turnos sin entrada o salida no se usan en los cálculos."
+        )
         if st.button("📄 Generar Reporte Completo"):
-            _show_airtable_error(generate_report)
+            if start_date > end_date:
+                st.error("La fecha inicial no puede ser posterior a la fecha final.")
+            else:
+                _show_airtable_error(
+                    lambda: generate_report(start_date, end_date)
+                )
